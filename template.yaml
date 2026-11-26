@@ -1,0 +1,404 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Patient records POC
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    Timeout: 5
+    MemorySize: 256
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "http://localhost:8000"
+          - !Sub "https://${WebDistribution.DomainName}"
+        AllowMethods: [ GET, POST, PUT, DELETE ]
+        AllowHeaders: [ content-type, authorization ]
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref UserPoolClient
+
+  PatientsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/patients/
+      Handler: app.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PatientsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PatientsTable
+        - Statement:
+            - Effect: Allow
+              Action: [ kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey ]
+              Resource: !GetAtt PatientsKey.Arn
+      Events:
+        GetHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        CreatePatient:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /patients, Method: POST }
+        GetPatient:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/patients/{id}", Method: GET }
+        UpdatePatient:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/patients/{id}", Method: PUT }
+        ListPatients:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /patients, Method: GET }
+        DeletePatient:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/patients/{id}", Method: DELETE }
+
+  PatientsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the patients table
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  PatientsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PatientsKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  BillsTableA:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: bill_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+        - AttributeName: bill_id
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PatientsKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  BillsTableB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: bill_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+        - AttributeName: bill_id
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PatientsKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  BillsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/bills/
+      Handler: app.handler
+      Environment:
+        Variables:
+          TABLE_A: !Ref BillsTableA
+          TABLE_B: !Ref BillsTableB
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BillsTableA
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BillsTableB
+        - Statement:
+            - Effect: Allow
+              Action: [ kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey ]
+              Resource: !GetAtt PatientsKey.Arn
+      Events:
+        CreateBill:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/bills/{table}/{patient_id}", Method: POST }
+        UpdateBill:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/bills/{table}/{patient_id}/{bill_id}", Method: PUT }
+        ListBills:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/bills/{table}/{patient_id}", Method: GET }
+        DeleteBill:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/bills/{table}/{patient_id}/{bill_id}", Method: DELETE }
+
+  TotalsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/totals/
+      Handler: app.handler
+      Environment:
+        Variables:
+          PATIENTS_TABLE: !Ref PatientsTable
+          EVENTS_TABLE: !Ref ProcessedEvents
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PatientsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProcessedEvents
+        - Statement:
+            - Effect: Allow
+              Action: [ kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey ]
+              Resource: !GetAtt PatientsKey.Arn
+      Events:
+        StreamA:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt BillsTableA.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+        StreamB:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt BillsTableB.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+
+  ProcessedEvents:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PatientsKey
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: event_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+        - AttributeName: event_key
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PatientsKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  AuditFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/audit/
+      Handler: app.handler
+      Environment:
+        Variables:
+          AUDIT_TABLE: !Ref AuditTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AuditTable.Arn
+            - Effect: Allow
+              Action: [ kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey ]
+              Resource: !GetAtt PatientsKey.Arn
+      Events:
+        PatientsStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt PatientsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+        BillsStreamA:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt BillsTableA.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+        BillsStreamB:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt BillsTableB.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UsernameAttributes: [ email ]
+      AutoVerifiedAttributes: [ email ]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub "health-poc-${AWS::AccountId}"
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [ code ]
+      AllowedOAuthScopes: [ openid, email ]
+      CallbackURLs:
+        - "http://localhost:8000/index.html"
+        - !Sub "https://${WebDistribution.DomainName}/index.html"
+      SupportedIdentityProviders: [ COGNITO ]
+
+  AuditReadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/audit_read/
+      Handler: app.handler
+      Environment:
+        Variables:
+          AUDIT_TABLE: !Ref AuditTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !GetAtt AuditTable.Arn
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt PatientsKey.Arn
+      Events:
+        GetAudit:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/audit/{patient_id}", Method: GET }
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: aws-health-web
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}"
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  AuditTableName:
+    Value: !Ref AuditTable
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  LoginDomain:
+    Value: !Sub "https://health-poc-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+  WebUrl:
+    Value: !Sub "https://${WebDistribution.DomainName}/index.html"
+  WebBucketName:
+    Value: !Ref WebBucket

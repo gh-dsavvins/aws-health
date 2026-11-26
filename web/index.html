@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Patients POC</title>
+<style>
+  body { font: 14px sans-serif; margin: 24px; }
+  table { border-collapse: collapse; margin: 8px 0 24px; }
+  th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; vertical-align: top; }
+  pre { margin: 0; font-size: 12px; }
+</style>
+</head>
+<body>
+<button onclick="refresh()">Refresh</button>
+<button onclick="logout()">Log out</button>
+
+<h2>Patients</h2>
+<input id="name" placeholder="name">
+<input id="dob" placeholder="date of birth">
+<button onclick="addPatient()">Add</button>
+<table id="patients"></table>
+
+<div id="detail" hidden>
+  <h2>Bills, table A</h2>
+  <button onclick="addBill('a')">Add bill</button>
+  <table id="bills-a"></table>
+  <h2>Bills, table B</h2>
+  <button onclick="addBill('b')">Add bill</button>
+  <table id="bills-b"></table>
+  <h2>Audit</h2>
+  <table id="audit"></table>
+</div>
+
+<script>
+const API = "https://shjbcl6e5e.execute-api.us-east-1.amazonaws.com";
+const LOGIN = "https://health-poc-521120123408.auth.us-east-1.amazoncognito.com";
+const CLIENT = "i6gp743okid8getou0mcjt7ug";
+const REDIRECT = location.origin + "/index.html";
+
+let token = sessionStorage.getItem("token");
+let patients = [], bills = {a: [], b: []}, selected = null;
+
+const b64url = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+async function login() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+  sessionStorage.setItem("verifier", verifier);
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  location.href = LOGIN + "/oauth2/authorize?" + new URLSearchParams({
+    response_type: "code", client_id: CLIENT, redirect_uri: REDIRECT,
+    scope: "openid email", code_challenge: b64url(hash), code_challenge_method: "S256",
+  });
+}
+
+async function finishLogin(code) {
+  const res = await fetch(LOGIN + "/oauth2/token", {
+    method: "POST",
+    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: new URLSearchParams({
+      grant_type: "authorization_code", client_id: CLIENT, code,
+      redirect_uri: REDIRECT, code_verifier: sessionStorage.getItem("verifier"),
+    }),
+  });
+  token = (await res.json()).access_token;
+  sessionStorage.setItem("token", token);
+  history.replaceState(null, "", REDIRECT);
+}
+
+function logout() {
+  sessionStorage.clear();
+  location.href = REDIRECT;
+}
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g,
+  c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+async function call(method, path, body) {
+  const headers = {Authorization: "Bearer " + token};
+  if (body) headers["Content-Type"] = "application/json";
+  const res = await fetch(API + path,
+    {method, headers, body: body ? JSON.stringify(body) : undefined});
+  if (res.status === 401) {
+    sessionStorage.removeItem("token");
+    await login();
+    return null;
+  }
+  const data = await res.json();
+  if (!res.ok) alert(res.status + " " + JSON.stringify(data));
+  return res.ok ? data : null;
+}
+
+function table(id, headers, rows) {
+  document.getElementById(id).innerHTML =
+    "<tr>" + headers.map(h => `<th>${h}</th>`).join("") + "</tr>" +
+    rows.map(r => "<tr>" + r.map(c => `<td>${c}</td>`).join("") + "</tr>").join("");
+}
+
+async function loadPatients() {
+  patients = await call("GET", "/patients") || [];
+  table("patients", ["Name", "Born", "Version", "Bills", "Billed, cents", "Modified by", ""],
+    patients.map((p, i) => [
+      esc(p.name), esc(p.date_of_birth), esc(p.version),
+      esc(p.bill_count ?? 0), esc(p.billed_sum_cents ?? 0), esc(p.modified_by_ip),
+      `<button onclick="selectPatient(${i})">Open</button>
+       <button onclick="editPatient(${i})">Edit</button>
+       <button onclick="deletePatient(${i})">Delete</button>`]));
+}
+
+async function addPatient() {
+  const name = document.getElementById("name").value;
+  const date_of_birth = document.getElementById("dob").value;
+  await call("POST", "/patients", {name, date_of_birth});
+  loadPatients();
+}
+
+async function editPatient(i) {
+  const p = patients[i];
+  const name = prompt("Name", p.name);
+  if (name === null) return;
+  await call("PUT", "/patients/" + p.patient_id,
+    {name, date_of_birth: p.date_of_birth, version: p.version});
+  loadPatients();
+}
+
+async function deletePatient(i) {
+  if (!confirm("Delete " + patients[i].name + "?")) return;
+  await call("DELETE", "/patients/" + patients[i].patient_id);
+  loadPatients();
+}
+
+function selectPatient(i) {
+  selected = patients[i].patient_id;
+  document.getElementById("detail").hidden = false;
+  loadDetail();
+}
+
+async function loadDetail() {
+  for (const t of ["a", "b"]) {
+    bills[t] = await call("GET", `/bills/${t}/${selected}`) || [];
+    table("bills-" + t, ["Description", "Cents", "Version", "Modified by", ""],
+      bills[t].map((b, i) => [
+        esc(b.description), esc(b.amount_cents), esc(b.version), esc(b.modified_by_ip),
+        `<button onclick="editBill('${t}', ${i})">Edit</button>
+         <button onclick="deleteBill('${t}', ${i})">Delete</button>`]));
+  }
+  const audit = await call("GET", "/audit/" + selected) || [];
+  table("audit", ["When", "Table", "Action", "Before", "After"],
+    audit.map(a => [
+      new Date(parseInt(a.event_key) * 1000).toLocaleString(),
+      esc(a.source_table), esc(a.action),
+      `<pre>${esc(JSON.stringify(a.old_image, null, 1))}</pre>`,
+      `<pre>${esc(JSON.stringify(a.new_image, null, 1))}</pre>`]));
+}
+
+async function addBill(t) {
+  const description = prompt("Description");
+  if (description === null) return;
+  const amount_cents = parseInt(prompt("Amount in cents"));
+  if (isNaN(amount_cents)) return;
+  await call("POST", `/bills/${t}/${selected}`, {description, amount_cents});
+  loadDetail();
+}
+
+async function editBill(t, i) {
+  const b = bills[t][i];
+  const amount_cents = parseInt(prompt("Amount in cents", b.amount_cents));
+  if (isNaN(amount_cents)) return;
+  await call("PUT", `/bills/${t}/${selected}/${b.bill_id}`,
+    {description: b.description, amount_cents, version: b.version});
+  loadDetail();
+}
+
+async function deleteBill(t, i) {
+  await call("DELETE", `/bills/${t}/${selected}/${bills[t][i].bill_id}`);
+  loadDetail();
+}
+
+function refresh() {
+  loadPatients();
+  if (selected) loadDetail();
+}
+
+async function start() {
+  const code = new URLSearchParams(location.search).get("code");
+  if (code) await finishLogin(code);
+  if (!token) return login();
+  loadPatients();
+}
+
+start();
+</script>
+</body>
+</html>
